@@ -48,3 +48,25 @@ expected_measurement, verify_url, models}` (401 if your New API rejects the key)
 
 Part of **fidrouter** — a verifiable, no-log LLM relay. Core + verify SDK:
 https://github.com/aoraki-labs/fidrouter
+
+## Verified-lane gating (optional)
+
+A gateway can run a plain lane and a verified (enclave) lane side by side. Gate the verified
+one by New API **group**, so you decide — and can price — which keys get it:
+
+```bash
+ALLOWED_GROUPS=enclave          # only keys in this group may mint a capability token
+NEWAPI_ADMIN_TOKEN=…            # PREFERRED: how the group is resolved (revocable)
+NEWAPI_ADMIN_USER_ID=1
+# Fallback for colocated installs. Off unless explicitly enabled, because the New API
+# database holds every user's key in plaintext — far more authority than this needs:
+# ALLOW_DB_GROUP_LOOKUP=1
+# NEWAPI_DB=/path/to/one-api.db
+```
+
+If a key's group cannot be **proven**, the exchange refuses to mint (fail-closed) — a gate
+that silently passes is worse than no gate. Create the group in New API under
+*Settings → group ratio* + *user-selectable groups*; **no channel is needed**, and a channel
+would in fact be wrong (it would let your gateway relay that lane and see plaintext).
+
+See [THREAT_MODEL.md](THREAT_MODEL.md) for exactly what this component can and cannot do.

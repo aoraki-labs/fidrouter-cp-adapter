@@ -45,6 +45,24 @@ MODELS = [m for m in os.environ.get("MODELS", "claude-3,gpt-4o,claude-opus-5").s
 TTL = int(os.environ.get("TTL", "3600"))
 QUOTA_PER_USD = int(os.environ.get("QUOTA_PER_USD", "500000"))  # New API rc.21 unit
 
+# --- verified-lane gating -------------------------------------------------
+# A gateway can offer BOTH a plain lane and a verified (enclave) lane. Only keys whose
+# New API *group* is in ALLOWED_GROUPS may be exchanged for a capability token, so the
+# operator controls (and can price) which lane a key belongs to.
+# Empty ALLOWED_GROUPS = no group restriction (any valid key), the previous behaviour.
+ALLOWED_GROUPS = [g.strip() for g in os.environ.get("ALLOWED_GROUPS", "").split(",") if g.strip()]
+# Group resolution. New API exposes no token-auth endpoint that reveals a key's group, so we
+# need one of two privileged paths. PREFER the admin API: it is portable (works with a remote
+# gateway), the credential is one the operator mints and can revoke, and it does not require
+# cp-adapter to sit on the same host as the database.
+NEWAPI_ADMIN_TOKEN = os.environ.get("NEWAPI_ADMIN_TOKEN", "")
+NEWAPI_ADMIN_USER_ID = os.environ.get("NEWAPI_ADMIN_USER_ID", "1")
+# Reading the New API database is a FALLBACK and must be opted into explicitly, because that
+# file contains every user's API key in plaintext — far more authority than "what group is
+# this key in?" needs. Prefer NEWAPI_ADMIN_TOKEN. See THREAT_MODEL.md.
+NEWAPI_DB = os.environ.get("NEWAPI_DB", "")
+ALLOW_DB_GROUP_LOOKUP = os.environ.get("ALLOW_DB_GROUP_LOOKUP", "") == "1"
+
 _seed_hex = os.environ.get("CP_SEED_HEX", "")
 if not _seed_hex:
     raise SystemExit("CP_SEED_HEX (control-plane ed25519 seed, hex) is required")
@@ -90,6 +108,62 @@ def validate_newapi_key(sk: str):
     return float(data.get("hard_limit_usd", 0))
 
 
+def _group_via_admin_api(sk: str):
+    """Resolve a key's group through the New API admin API (works with a remote gateway)."""
+    req = urllib.request.Request(
+        f"{NEWAPI_BASE}/api/token/?p=0&size=500",
+        headers={"Authorization": f"Bearer {NEWAPI_ADMIN_TOKEN}",
+                 "New-Api-User": str(NEWAPI_ADMIN_USER_ID)})
+    with urllib.request.urlopen(req, timeout=8, context=_TLS) as r:
+        data = json.loads(r.read())
+    items = data.get("data")
+    if isinstance(items, dict):  # some builds wrap the page as {items:[...]}
+        items = items.get("items") or items.get("records") or []
+    bare = sk[3:] if sk.startswith("sk-") else sk
+    for it in items or []:
+        if it.get("key") == bare:
+            return (it.get("group") or "").strip(), it.get("user_id")
+    return None, None
+
+
+def _group_via_db(sk: str):
+    """Resolve a key's group by reading the New API DB read-only (colocated deployment)."""
+    import sqlite3
+    bare = sk[3:] if sk.startswith("sk-") else sk
+    con = sqlite3.connect(f"file:{NEWAPI_DB}?mode=ro", uri=True, timeout=5)
+    try:
+        row = con.execute(
+            'select "group", user_id, status from tokens where key=? and (deleted_at is null)',
+            (bare,)).fetchone()
+        if not row:
+            return None, None
+        grp, uid, status = (row[0] or "").strip(), row[1], row[2]
+        if status != 1:
+            return None, uid  # disabled/expired token → refuse
+        if not grp:  # empty token group means "inherit the user's group"
+            urow = con.execute('select "group" from users where id=?', (uid,)).fetchone()
+            grp = ((urow[0] if urow else "") or "").strip()
+        return grp, uid
+    finally:
+        con.close()
+
+
+def group_for(sk: str):
+    """Resolve a key's group. Returns (group, user_id); group None = unresolvable (caller
+    fails closed). Admin API first; the DB read is only used when explicitly enabled."""
+    if NEWAPI_ADMIN_TOKEN:
+        try:
+            return _group_via_admin_api(sk)
+        except Exception:  # noqa: BLE001 — fall through to the opt-in DB path
+            pass
+    if ALLOW_DB_GROUP_LOOKUP and NEWAPI_DB and os.path.exists(NEWAPI_DB):
+        try:
+            return _group_via_db(sk)
+        except Exception:  # noqa: BLE001
+            return None, None
+    return None, None
+
+
 def tenant_for(sk: str) -> str:
     """Content-free, stable per-token id. Lets metering attribute usage to *this*
     New API token without the enclave or console ever seeing the key itself."""
@@ -121,11 +195,27 @@ class H(BaseHTTPRequestHandler):
         remaining_usd = validate_newapi_key(sk)
         if remaining_usd is None:
             return self._send(401, {"error": "New API rejected this key (invalid/expired/no quota)"})
+        group = None
+        if ALLOWED_GROUPS:
+            # Verified lane is gated by group. Fail CLOSED: if we cannot prove which group
+            # the key belongs to, we must not mint a token — a silent pass would make the
+            # whole gate meaningless.
+            group, _uid = group_for(sk)
+            if group is None:
+                return self._send(503, {
+                    "error": "cannot resolve this key's group, refusing to mint (fail-closed). "
+                             "Configure NEWAPI_ADMIN_TOKEN or NEWAPI_DB on cp-adapter."})
+            if group not in ALLOWED_GROUPS:
+                return self._send(403, {
+                    "error": f"key is in group '{group}', which is not enabled for the verified "
+                             f"(enclave) lane. Allowed: {', '.join(ALLOWED_GROUPS)}.",
+                    "group": group, "allowed_groups": ALLOWED_GROUPS})
         tenant = tenant_for(sk)
         tok = mint_capability(tenant, max_tok=int(remaining_usd * QUOTA_PER_USD))
         self._send(200, {
             "capability_token": tok,
             "tenant": tenant,
+            "group": group,
             "enclave_url": ENCLAVE_URL,
             "expected_measurement": EXPECTED_MEASUREMENT,
             "verify_url": VERIFY_URL,
@@ -136,7 +226,11 @@ class H(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/healthz":
-            return self._send(200, {"ok": True, "newapi": NEWAPI_BASE, "enclave": ENCLAVE_URL})
+            return self._send(200, {"ok": True, "newapi": NEWAPI_BASE, "enclave": ENCLAVE_URL,
+                                    "allowed_groups": ALLOWED_GROUPS,
+                                    "group_lookup": ("admin-api" if NEWAPI_ADMIN_TOKEN else
+                                                     "db(opt-in)" if (ALLOW_DB_GROUP_LOOKUP and NEWAPI_DB)
+                                                     else "none")})
         self._send(404, {"error": "not found"})
 
 
